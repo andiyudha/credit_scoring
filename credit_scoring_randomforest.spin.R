@@ -1,0 +1,470 @@
+# test credit scoring with random forest classification
+
+# load library ------------------------------------------------------------
+
+library(tidyverse)
+library(Metrics)
+library(caret)
+library(randomForest)
+library(mice)
+library(missForest)
+library(vroom)
+library(InformationValue)
+library(ISLR)
+
+# set working -------------------------------------------------------------
+
+#setwd("D:\\000 Project_R\\55_inalyst_credit")
+
+# load data ---------------------------------------------------------------
+
+credit_train <- vroom("train.csv")
+credit_test <- vroom("test.csv")
+glimpse(credit_test)
+glimpse(credit_train)
+
+# processing data ---------------------------------------------------------
+
+credit_train %>%
+  mutate(
+    Train = TRUE
+  ) %>%
+  glimpse() -> credit_train
+
+credit_test %>%
+  mutate(
+    Train = FALSE
+  ) %>%
+  glimpse() -> credit_test
+
+credit_test %>%
+  mutate(
+    default = 1 # gagal bayar
+  ) %>%
+  glimpse() -> test_tmp
+#combine data
+glimpse(credit_train)
+test_tmp %>%
+  select(
+    customer_id:tenure,default,Train
+  ) %>%
+  glimpse() -> test_tmp
+
+all_data <- rbind(credit_train, test_tmp)
+
+# check data --------------------------------------------------------------
+# calculate tenure in month
+# check who is dependencies status due to not have any revenue
+view(all_data)
+all_data %>%
+  mutate(
+    tenure_year = parse_number(str_extract(tenure,"[0-9]")),
+    tenure_month = parse_number(str_extract(tenure,"(?<=\\s)[0-9]")),
+    tenure_in_month = (tenure_year*12) + tenure_month,
+    student_class = case_when(
+      student == "Yes" ~ 1,
+      TRUE ~ 0
+    ),
+    employment_fix = case_when(
+      is.na(employment) ~ "Dependents", # student or no with no revenue
+      TRUE ~ employment
+    )
+  ) %>%
+  glimpse() -> all_data
+
+#select data for classification
+all_data %>%
+  select(
+    customer_id:phone_flag,
+    student_class, employment_fix,
+    credit_card:income, tenure_in_month,
+    default:Train
+  ) %>%
+  glimpse() -> all_data_fix
+
+summary(all_data_fix)
+glimpse(all_data_fix)
+
+all_data_fix %>%
+  mutate(
+    gender = as.factor(gender),
+    employment_fix = as.factor(employment_fix)
+  ) %>%
+  glimpse() -> all_data_fix
+
+
+# check missing data ------------------------------------------------------
+#using mice package
+
+md.pattern(all_data_fix)
+temp_data <- mice(all_data_fix,m=5,maxit=50,method = 'logreg',seed=500)
+summary(temp_data)
+complete(temp_data,1)
+xyplot(temp_data,default ~ gender+credit_card,pch=18,cex=1)
+densityplot(temp_data)
+stripplot(temp_data, pch = 20, cex = 1.2)
+
+all_data_fix_imp <- complete(temp_data,5) %>%
+  glimpse() # imputation data
+
+md.pattern(all_data_fix_imp)
+
+#For the algorithm to be more efficient, it is a good idea to create dummy-variables (or one-hot-encodings). This should help speed up the algorithms. There is a really good package to do this automatically for us calld fastDummies. The function I will use is called dummy_cols and it automatically turns all factor variables or character variables into dummy variables (or one-hot-encodings). You can additionally specify which columns to do this to if you don't want to do this to all of your columns. The aurgument remove_most_frequent_dummy = TRUE just removes one of the dummy variables. This is a good idea because keeping all of the one-hot-encodings would be keeping too-much information; knowing all of the categories but one allows you to know the other category.
+
+all_data_fix_imp %>%
+  fastDummies::dummy_cols(remove_most_frequent_dummy = FALSE) %>%
+  select(-c(gender, employment_fix)) %>%
+  glimpse() -> all_data_fix_2
+
+#select data
+today <- lubridate::as_date("2021-01-01")
+all_data_fix_2 %>%
+  mutate(
+    age_years = (as.integer(today) - as.integer(customer_bod))/365,
+    employment_fix_Self_Employed = `employment_fix_Self Employed`,
+    default = as.factor(default)
+  ) %>%
+  select(
+    -c(customer_bod,`employment_fix_Self Employed`)
+  ) %>%
+  glimpse() -> all_data_fix_ok
+
+# split data for train and test -------------------------------------------
+
+all_data_fix_ok %>%
+  filter(Train) %>%
+  select(-Train) %>%
+  glimpse() -> train_mf
+
+all_data_fix_ok %>%
+  filter(!Train) %>%
+  select(-Train) %>%
+  glimpse() -> test_mf
+
+# definition the predictor and yield --------------------------------------
+# Split Data into Training and validation for the model
+sample_size = floor(0.8*nrow(train_mf))
+set.seed(777)
+
+# randomly split data in r
+picked = sample(seq_len(nrow(train_mf)),size = sample_size)
+train_set =train_mf[picked,] %>% glimpse()
+val_set =train_mf[-picked,] %>% glimpse()
+
+train_set %>%
+  select(-c(customer_id)) -> train_data
+
+val_set %>%
+  select(-c(customer_id,default)) -> val_data
+
+test_mf %>%
+  select(-c(customer_id,default)) -> test_data
+
+# model with caret for randomforest ---------------------------------------
+
+rf_model<-train(default~.,
+                data=train_data,
+                method="rf",
+                trControl=trainControl(method="cv",number=5, verboseIter = TRUE),
+                prox=TRUE,
+                allowParallel=TRUE,
+                trace = TRUE)
+print(rf_model)
+
+# evaluate model and predict ----------------------------------------------
+
+prediction <- predict(rf_model, newdata = val_data)
+
+confusionMatrix(prediction, val_set$default, mode = "everything")
+
+# Reference
+# Prediction   0   1
+# 0 678  43
+# 1   3  15
+# 
+# Accuracy : 0.9378          
+# 95% CI : (0.9178, 0.9541)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.05425         
+# 
+# Kappa : 0.3714          
+# 
+# Mcnemar's Test P-Value : 8.912e-09       
+#                                           
+#             Sensitivity : 0.9956          
+#             Specificity : 0.2586          
+#          Pos Pred Value : 0.9404          
+#          Neg Pred Value : 0.8333          
+#               Precision : 0.9404          
+#                  Recall : 0.9956          
+#                      F1 : 0.9672          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9175          
+#    Detection Prevalence : 0.9756          
+#       Balanced Accuracy : 0.6271          
+#                                           
+#        'Positive' Class : 0 
+
+# fine best tuning the model ----------------------------------------------
+
+# Define the control
+trControl <- trainControl(method = "cv",
+                          number = 10,
+                          search = "grid",
+                          verboseIter = TRUE)
+
+# default model -----------------------------------------------------------
+
+set.seed(1234)
+# Run the model
+rf_default <- train(default~.,
+                    data = train_data,
+                    method = "rf",
+                    metric = "Accuracy",
+                    trControl = trControl)
+# Print the results
+print(rf_default)
+#evaluate
+prediction_default <- predict(rf_default, newdata = val_data)
+
+confusionMatrix(prediction_default, val_set$default, mode = "everything")
+# Confusion Matrix and Statistics
+# 
+# Reference
+# Prediction   0   1
+# 0 667  29
+# 1  14  29
+# 
+# Accuracy : 0.9418          
+# 95% CI : (0.9224, 0.9576)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.02028         
+# 
+# Kappa : 0.5438          
+# 
+# Mcnemar's Test P-Value : 0.03276         
+#                                           
+#             Sensitivity : 0.9794          
+#             Specificity : 0.5000          
+#          Pos Pred Value : 0.9583          
+#          Neg Pred Value : 0.6744          
+#               Precision : 0.9583          
+#                  Recall : 0.9794          
+#                      F1 : 0.9688          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9026          
+#    Detection Prevalence : 0.9418          
+#       Balanced Accuracy : 0.7397          
+#                                           
+#        'Positive' Class : 0
+
+# find mtry ---------------------------------------------------------------
+
+set.seed(1234)
+tuneGrid <- expand.grid(.mtry = c(1:10))
+rf_mtry <- train(default~.,
+                 data = train_data,
+                 method = "rf",
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl = trControl,
+                 importance = TRUE,
+                 nodesize = 14,
+                 ntree = 300)
+print(rf_mtry)
+best_mtry <- rf_mtry$bestTune$mtry
+best_mtry
+#evaluate
+prediction_mtry <- predict(rf_mtry, newdata = val_data)
+
+confusionMatrix(prediction_mtry, val_set$default, mode = "everything")
+# Reference
+# Prediction   0   1
+# 0 673  31
+# 1   8  27
+# 
+# Accuracy : 0.9472          
+# 95% CI : (0.9286, 0.9622)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.003984        
+# 
+# Kappa : 0.5543          
+# 
+# Mcnemar's Test P-Value : 0.000427        
+#                                           
+#             Sensitivity : 0.9883          
+#             Specificity : 0.4655          
+#          Pos Pred Value : 0.9560          
+#          Neg Pred Value : 0.7714          
+#               Precision : 0.9560          
+#                  Recall : 0.9883          
+#                      F1 : 0.9718          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9107          
+#    Detection Prevalence : 0.9526          
+#       Balanced Accuracy : 0.7269          
+#                                           
+#        'Positive' Class : 0
+
+# find best maxnode -------------------------------------------------------
+
+store_maxnode <- list()
+tuneGrid <- expand.grid(.mtry = best_mtry)
+for (maxnodes in c(14:30)) {
+  set.seed(1234)
+  rf_maxnode <- train(default~.,
+                      data = train_data,
+                      method = "rf",
+                      metric = "Accuracy",
+                      tuneGrid = tuneGrid,
+                      trControl = trControl,
+                      importance = TRUE,
+                      nodesize = 14,
+                      maxnodes = maxnodes,
+                      ntree = 300)
+  key <- toString(maxnodes)
+  store_maxnode[[key]] <- rf_maxnode
+}
+results_node <- resamples(store_maxnode)
+summary(results_node)
+#evaluate
+prediction_maxnode <- predict(rf_maxnode, newdata = val_data)
+
+confusionMatrix(prediction_maxnode, val_set$default, mode = "everything")
+# Confusion Matrix and Statistics
+# 
+# Reference
+# Prediction   0   1
+# 0 675  33
+# 1   6  25
+# 
+# Accuracy : 0.9472          
+# 95% CI : (0.9286, 0.9622)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.003984        
+# 
+# Kappa : 0.5365          
+# 
+# Mcnemar's Test P-Value : 3.136e-05       
+#                                           
+#             Sensitivity : 0.9912          
+#             Specificity : 0.4310          
+#          Pos Pred Value : 0.9534          
+#          Neg Pred Value : 0.8065          
+#               Precision : 0.9534          
+#                  Recall : 0.9912          
+#                      F1 : 0.9719          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9134          
+#    Detection Prevalence : 0.9581          
+#       Balanced Accuracy : 0.7111          
+#                                           
+#        'Positive' Class : 0
+
+# Search the best ntrees --------------------------------------------------
+
+store_maxtrees <- list()
+for (ntree in c(250, 300, 350, 400, 450, 500, 550, 600, 800, 1000, 2000)) {
+  set.seed(5678)
+  rf_maxtrees <- train(default~.,
+                       data = train_data,
+                       method = "rf",
+                       metric = "Accuracy",
+                       tuneGrid = tuneGrid,
+                       trControl = trControl,
+                       importance = TRUE,
+                       nodesize = 14,
+                       maxnodes = 14,
+                       ntree = ntree)
+  key <- toString(ntree)
+  store_maxtrees[[key]] <- rf_maxtrees
+}
+results_tree <- resamples(store_maxtrees)
+summary(results_tree)
+#evaluate
+prediction_maxtrees <- predict(rf_maxtrees, newdata = val_data)
+
+confusionMatrix(prediction_maxtrees, val_set$default, mode = "everything")
+# Confusion Matrix and Statistics
+# 
+# Reference
+# Prediction   0   1
+# 0 676  34
+# 1   5  24
+# 
+# Accuracy : 0.9472          
+# 95% CI : (0.9286, 0.9622)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.003984        
+# 
+# Kappa : 0.527           
+# 
+# Mcnemar's Test P-Value : 7.34e-06        
+#                                           
+#             Sensitivity : 0.9927          
+#             Specificity : 0.4138          
+#          Pos Pred Value : 0.9521          
+#          Neg Pred Value : 0.8276          
+#               Precision : 0.9521          
+#                  Recall : 0.9927          
+#                      F1 : 0.9720          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9147          
+#    Detection Prevalence : 0.9608          
+#       Balanced Accuracy : 0.7032          
+#                                           
+#        'Positive' Class : 0  
+
+
+# final model -------------------------------------------------------------
+# ntree = 2000
+# nodes = 14
+fit_rf <- train(default~.,
+                train_data,
+                method = "rf",
+                metric = "Accuracy",
+                tuneGrid = tuneGrid,
+                trControl = trControl,
+                importance = TRUE,
+                nodesize = 14,
+                ntree = 2000,
+                maxnodes = 14)
+#evaluate
+prediction_fit <- predict(fit_rf, newdata = val_data)
+
+confusionMatrix(prediction_fit, val_set$default, mode = "everything")
+#Confusion Matrix and Statistics
+# Reference
+# Prediction   0   1
+# 0 676  34
+# 1   5  24
+# 
+# Accuracy : 0.9472          
+# 95% CI : (0.9286, 0.9622)
+# No Information Rate : 0.9215          
+# P-Value [Acc > NIR] : 0.003984        
+# 
+# Kappa : 0.527           
+# 
+# Mcnemar's Test P-Value : 7.34e-06        
+#                                           
+#             Sensitivity : 0.9927          
+#             Specificity : 0.4138          
+#          Pos Pred Value : 0.9521          
+#          Neg Pred Value : 0.8276          
+#               Precision : 0.9521          
+#                  Recall : 0.9927          
+#                      F1 : 0.9720          
+#              Prevalence : 0.9215          
+#          Detection Rate : 0.9147          
+#    Detection Prevalence : 0.9608          
+#       Balanced Accuracy : 0.7032          
+#                                           
+#        'Positive' Class : 0
+
+# create submission -------------------------------------------------------
+#predict test data
+
+data.frame(customer_id = test_mf$customer_id, default = predict(fit_rf, test_data)) -> rf_predictions
+
+write.csv(rf_predictions, file = 'rf_submission.csv', row.names = F)
